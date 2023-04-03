@@ -138,6 +138,8 @@ func Run(configSpec config.Spec, uuid string, p *prometheus.Prometheus, alertM *
 				if job.Config.Churn {
 					job.RunCreateJobWithChurn()
 				}
+				//wait process all event.
+				time.Sleep(time.Second * 30)
 				// We stop and index measurements per job
 				if measurements.Stop() == 1 {
 					innerRC = 1

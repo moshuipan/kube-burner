@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	kvv1 "kubevirt.io/api/core/v1"
+	cdiv1beta1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 )
 
 const (
@@ -53,6 +54,15 @@ type vmiMetric struct {
 	PodContainersReadyLatency int `json:"podContainersReadyLatency"`
 	podReady                  time.Time
 	PodReadyLatency           int `json:"podReadyLatency"`
+
+	DVCreated               time.Time
+	DVCreatedLatency        int `json:"dvCreatedLatency"`
+	DVPending               time.Time
+	DVPendingLatency        int `json:"dvPendingLatency"`
+	DVCloneScheduled        time.Time
+	DVCloneScheduledLatency int `json:"dvCloneScheduledLatency"`
+	DVSucceeded             time.Time
+	DVSucceededLatency      int `json:"dvSucceededLatency"`
 
 	vmiCreated           time.Time
 	VMICreatedLatency    int `json:"vmiCreatedLatency"`
@@ -83,6 +93,7 @@ type vmiLatency struct {
 	vmWatcher        *metrics.Watcher
 	vmiWatcher       *metrics.Watcher
 	vmiPodWatcher    *metrics.Watcher
+	dvWatcher        *metrics.Watcher
 	metrics          map[string]*vmiMetric
 	latencyQuantiles []interface{}
 	normLatencies    []interface{}
@@ -122,6 +133,62 @@ func (p *vmiLatency) handleUpdateVM(obj interface{}) {
 				if c.Type == kvv1.VirtualMachineReady {
 					vmM.vmReady = time.Now().UTC()
 				}
+			}
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *vmiLatency) handleCreateDV(obj interface{}) {
+	dv := obj.(*cdiv1beta1.DataVolume)
+	vmID := dv.Labels["kubevirt-vm"]
+	p.mu.Lock()
+	if _, exists := p.metrics[vmID]; !exists {
+		if strings.Contains(dv.Namespace, factory.jobConfig.Namespace) {
+			p.metrics[vmID] = &vmiMetric{
+				Timestamp:  time.Now().UTC(),
+				Namespace:  dv.Namespace,
+				Name:       dv.Name,
+				MetricName: vmiLatencyMeasurement,
+				UUID:       factory.uuid,
+				JobName:    factory.jobConfig.Name,
+			}
+		}
+	}
+	if vmiM, exists := p.metrics[vmID]; exists {
+		if vmiM.DVCreated.IsZero() {
+			vmiM.DVCreated = time.Now().UTC()
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *vmiLatency) handleUpdateDV(obj interface{}) {
+	var vmID string
+	dv := obj.(*cdiv1beta1.DataVolume)
+	// in case the parent is a VM object
+	if id, exists := dv.Labels["kubevirt-vm"]; exists {
+		vmID = id
+	}
+	// in case the parent is a VMI object
+	if vmID == "" {
+		vmID = string(dv.UID)
+	}
+	p.mu.Lock()
+	if vmiM, exists := p.metrics[vmID]; exists && vmiM.DVSucceeded.IsZero() {
+		// Although the pattern of using phase is deprecated, kubevirt still strongly relies on it.
+		switch dv.Status.Phase {
+		case cdiv1beta1.Pending:
+			if vmiM.DVPending.IsZero() {
+				vmiM.DVPending = time.Now().UTC()
+			}
+		case cdiv1beta1.Succeeded:
+			if vmiM.DVSucceeded.IsZero() {
+				vmiM.DVSucceeded = time.Now().UTC()
+			}
+		case cdiv1beta1.CloneScheduled:
+			if vmiM.DVCloneScheduled.IsZero() {
+				vmiM.DVCloneScheduled = time.Now().UTC()
 			}
 		}
 	}
@@ -301,6 +368,23 @@ func (p *vmiLatency) start(measurementWg *sync.WaitGroup) {
 		log.Errorf("VMI Latency measurement error: %s", err)
 	}
 
+	log.Infof("Creating DV latency watcher for %s", factory.jobConfig.Name)
+	p.dvWatcher = metrics.NewWatcher(
+		newRESTClientWithRegisteredCDIResource(),
+		"dvWatcher",
+		"datavolumes",
+		v1.NamespaceAll,
+	)
+	p.dvWatcher.Informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: p.handleCreateDV,
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			p.handleUpdateDV(newObj)
+		},
+	})
+	if err := p.dvWatcher.StartAndCacheSync(); err != nil {
+		log.Errorf("VMI Latency measurement error: %s", err)
+	}
+
 	log.Infof("Creating VMI latency watcher for %s", factory.jobConfig.Name)
 	p.vmiWatcher = metrics.NewWatcher(
 		restClient,
@@ -347,6 +431,23 @@ func newRESTClientWithRegisteredKubevirtResource() *rest.RESTClient {
 	return restClient
 }
 
+func newRESTClientWithRegisteredCDIResource() *rest.RESTClient {
+	shallowCopy := factory.restConfig
+	gv := cdiv1beta1.SchemeGroupVersion
+	shallowCopy.GroupVersion = &gv
+	shallowCopy.APIPath = "/apis"
+	scheme := runtime.NewScheme()
+	codecs := serializer.NewCodecFactory(scheme)
+	cdiv1beta1.AddToScheme(scheme)
+	shallowCopy.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{CodecFactory: codecs}
+	restClient, err := rest.RESTClientFor(shallowCopy)
+	if err != nil {
+		log.Errorf("Error creating custom rest client: %s", err)
+		panic(err)
+	}
+	return restClient
+}
+
 func setConfigDefaults(config *rest.Config) {
 	gv := kvv1.SchemeGroupVersion
 	config.GroupVersion = &gv
@@ -362,6 +463,7 @@ func setConfigDefaults(config *rest.Config) {
 // Stop stops vmiLatency measurement
 func (p *vmiLatency) stop() (int, error) {
 	p.vmWatcher.StopWatcher()
+	p.dvWatcher.StopWatcher()
 	p.vmiWatcher.StopWatcher()
 	p.vmiPodWatcher.StopWatcher()
 	p.normalizeMetrics()
@@ -395,6 +497,11 @@ func (p *vmiLatency) normalizeMetrics() {
 		}
 		m.VMReadyLatency = int(m.vmReady.Sub(m.Timestamp).Milliseconds())
 
+		m.DVCreatedLatency = int(m.DVCreated.Sub(m.Timestamp).Milliseconds())
+		m.DVPendingLatency = int(m.DVPending.Sub(m.Timestamp).Milliseconds())
+		m.DVCloneScheduledLatency = int(m.DVCloneScheduled.Sub(m.Timestamp).Milliseconds())
+		m.DVSucceededLatency = int(m.DVSucceeded.Sub(m.Timestamp).Milliseconds())
+
 		m.VMICreatedLatency = int(m.vmiCreated.Sub(m.Timestamp).Milliseconds())
 		m.VMIPendingLatency = int(m.vmiPending.Sub(m.Timestamp).Milliseconds())
 		m.VMISchedulingLatency = int(m.vmiScheduling.Sub(m.Timestamp).Milliseconds())
@@ -420,6 +527,11 @@ func (p *vmiLatency) calcQuantiles() {
 			quantileMap["VM"+string(kvv1.VirtualMachineReady)] = append(quantileMap["VM"+string(kvv1.VirtualMachineReady)], normLatency.(*vmiMetric).VMReadyLatency)
 			quantileMap["VMICreated"] = append(quantileMap["VMICreated"], normLatency.(*vmiMetric).VMICreatedLatency)
 		}
+
+		quantileMap["DVCreated"] = append(quantileMap["DVCreated"], normLatency.(*vmiMetric).DVCreatedLatency)
+		quantileMap["DV"+string(cdiv1beta1.Pending)] = append(quantileMap["DV"+string(cdiv1beta1.Pending)], normLatency.(*vmiMetric).DVPendingLatency)
+		quantileMap["DV"+string(cdiv1beta1.CloneScheduled)] = append(quantileMap["DV"+string(cdiv1beta1.CloneScheduled)], normLatency.(*vmiMetric).DVCloneScheduledLatency)
+		quantileMap["DV"+string(cdiv1beta1.Succeeded)] = append(quantileMap["DV"+string(cdiv1beta1.Succeeded)], normLatency.(*vmiMetric).DVSucceededLatency)
 
 		quantileMap["VMI"+string(kvv1.Pending)] = append(quantileMap["VMI"+string(kvv1.Pending)], normLatency.(*vmiMetric).VMIPendingLatency)
 		quantileMap["VMI"+string(kvv1.Scheduling)] = append(quantileMap["VMI"+string(kvv1.Scheduling)], normLatency.(*vmiMetric).VMISchedulingLatency)
