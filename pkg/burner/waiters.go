@@ -65,6 +65,8 @@ func (ex *Executor) waitForObjects(ns string) {
 				go waitForVMI(ns, ex.Config.MaxWaitTimeout, &wg)
 			case "VirtualMachineInstanceReplicaSet":
 				go waitForVMIRS(ns, ex.Config.MaxWaitTimeout, &wg)
+			case "VirtualMachineInstanceMigration":
+				go waitForVMIM(ns, ex.Config.MaxWaitTimeout, &wg)
 			case "Job":
 				go waitForJob(ns, ex.Config.MaxWaitTimeout, &wg)
 			case "PersistentVolumeClaim":
@@ -307,5 +309,21 @@ func waitForVMIRS(ns string, maxWaitTimeout time.Duration, wg *sync.WaitGroup) {
 			}
 		}
 		return true, nil
+	})
+}
+
+func waitForVMIM(ns string, maxWaitTimeout time.Duration, wg *sync.WaitGroup) {
+	defer wg.Done()
+	vmimGVR := schema.GroupVersionResource{
+		Group:    types.KubevirtGroup,
+		Version:  types.KubevirtAPIVersion,
+		Resource: types.VirtualMachineInstanceMigrationResource,
+	}
+	wait.PollImmediate(10*time.Second, maxWaitTimeout, func() (bool, error) {
+		objs, err := waitDynamicClient.Resource(vmimGVR).Namespace(ns).List(context.TODO(), metav1.ListOptions{FieldSelector: "status.phase!=Succeeded"})
+		if err != nil {
+			return false, err
+		}
+		return len(objs.Items) == 0, nil
 	})
 }

@@ -35,6 +35,7 @@ const (
 	VirtualMachineResource                   = "virtualmachines"
 	VirtualMachineInstanceResource           = "virtualmachineinstances"
 	VirtualMachineInstanceReplicaSetResource = "virtualmachineinstancereplicasets"
+	VirtualMachineInstanceMigrationResource  = "virtualmachineinstancemigrations"
 )
 
 type Object struct {

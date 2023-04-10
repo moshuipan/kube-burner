@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	kvv1 "kubevirt.io/api/core/v1"
 	cdiv1beta1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -351,7 +352,7 @@ func (p *vmiLatency) start(measurementWg *sync.WaitGroup) {
 	p.metrics = make(map[string]*vmiMetric)
 
 	log.Infof("Creating VM latency watcher for %s", factory.jobConfig.Name)
-	restClient := newRESTClientWithRegisteredKubevirtResource()
+	restClient, _ := newRESTClientWithRegisteredKubevirtResource()
 	p.vmWatcher = metrics.NewWatcher(
 		restClient,
 		"vmWatcher",
@@ -420,7 +421,7 @@ func (p *vmiLatency) start(measurementWg *sync.WaitGroup) {
 	}
 }
 
-func newRESTClientWithRegisteredKubevirtResource() *rest.RESTClient {
+func newRESTClientWithRegisteredKubevirtResource() (*rest.RESTClient, client.Client) {
 	shallowCopy := factory.restConfig
 	setConfigDefaults(shallowCopy)
 	restClient, err := rest.RESTClientFor(shallowCopy)
@@ -428,7 +429,14 @@ func newRESTClientWithRegisteredKubevirtResource() *rest.RESTClient {
 		log.Errorf("Error creating custom rest client: %s", err)
 		panic(err)
 	}
-	return restClient
+	sc := runtime.NewScheme()
+	kvv1.AddToScheme(sc)
+	c, err := client.New(shallowCopy, client.Options{Scheme: sc})
+	if err != nil {
+		log.Errorf("Error creating custom operator client: %s", err)
+		panic(err)
+	}
+	return restClient, c
 }
 
 func newRESTClientWithRegisteredCDIResource() *rest.RESTClient {
